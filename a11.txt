@@ -1,0 +1,804 @@
+# decorators.py
+import functools
+import json
+from django.http import JsonResponse, HttpResponse
+from django.shortcuts import render
+from django.urls import reverse
+from django.contrib.sessions.backends.db import SessionStore
+from celery import shared_task
+from celery.result import AsyncResult
+import uuid
+
+
+@shared_task
+def execute_view_task(view_module, view_name, request_data, task_id):
+    """
+    Zadanie Celery wykonujące oryginalną funkcję view w tle
+    """
+    try:
+        # Import modułu i funkcji view
+        module = __import__(view_module, fromlist=[view_name])
+        view_func = getattr(module, view_name)
+        
+        # Rekonstrukcja request (uproszczona)
+        from django.test import RequestFactory
+        factory = RequestFactory()
+        
+        if request_data['method'] == 'POST':
+            request = factory.post(
+                request_data['path'],
+                data=request_data.get('POST', {}),
+                content_type='application/json' if request_data.get('is_json') else 'application/x-www-form-urlencoded'
+            )
+        else:
+            request = factory.get(request_data['path'], request_data.get('GET', {}))
+        
+        # Dodanie atrybutów do request
+        request.user = request_data.get('user')
+        request.session = request_data.get('session', {})
+        
+        # Wykonanie oryginalnej funkcji
+        result = view_func(request, **request_data.get('kwargs', {}))
+        
+        # Zwrócenie rezultatu
+        if hasattr(result, 'content'):
+            return {
+                'success': True,
+                'content': result.content.decode('utf-8'),
+                'status_code': result.status_code,
+                'task_id': task_id
+            }
+        else:
+            return {
+                'success': True,
+                'result': str(result),
+                'task_id': task_id
+            }
+            
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e),
+            'task_id': task_id
+        }
+
+
+def async_processing(
+    loading_template='async_loading.html',
+    success_template=None,
+    error_template='async_error.html',
+    timeout=300,  # 5 minut timeout
+    poll_interval=2000  # sprawdzanie co 2 sekundy
+):
+    """
+    Dekorator dla długotrwałych endpointów Django
+    
+    Args:
+        loading_template: szablon wyświetlany podczas ładowania
+        success_template: szablon dla sukcesu (opcjonalny)
+        error_template: szablon dla błędu
+        timeout: maksymalny czas oczekiwania w sekundach
+        poll_interval: interwał sprawdzania statusu w milisekundach
+    """
+    def decorator(view_func):
+        @functools.wraps(view_func)
+        def wrapper(request, *args, **kwargs):
+            # Sprawdź czy to żądanie AJAX sprawdzające status
+            if request.GET.get('check_status'):
+                task_id = request.GET.get('task_id')
+                if task_id:
+                    result = AsyncResult(task_id)
+                    
+                    if result.ready():
+                        task_result = result.get()
+                        if task_result.get('success'):
+                            return JsonResponse({
+                                'status': 'completed',
+                                'content': task_result.get('content', ''),
+                                'redirect': request.GET.get('redirect_url', '')
+                            })
+                        else:
+                            return JsonResponse({
+                                'status': 'error',
+                                'error': task_result.get('error', 'Nieznany błąd')
+                            })
+                    else:
+                        return JsonResponse({'status': 'processing'})
+                
+                return JsonResponse({'status': 'error', 'error': 'Brak task_id'})
+            
+            # Sprawdź czy zadanie już istnieje w sesji
+            existing_task_id = request.session.get(f'async_task_{request.path}')
+            if existing_task_id:
+                result = AsyncResult(existing_task_id)
+                if not result.ready():
+                    # Zadanie wciąż się wykonuje, pokaż loading
+                    return render(request, loading_template, {
+                        'task_id': existing_task_id,
+                        'poll_interval': poll_interval,
+                        'current_url': request.build_absolute_uri(),
+                        'timeout': timeout * 1000  # konwersja na milisekundy
+                    })
+            
+            # Przygotowanie danych dla zadania
+            task_id = str(uuid.uuid4())
+            request_data = {
+                'method': request.method,
+                'path': request.path,
+                'GET': dict(request.GET),
+                'POST': dict(request.POST) if request.method == 'POST' else {},
+                'kwargs': kwargs,
+                'user': request.user.id if request.user.is_authenticated else None,
+                'session': dict(request.session),
+                'is_json': request.content_type == 'application/json'
+            }
+            
+            # Uruchomienie zadania w tle
+            task = execute_view_task.delay(
+                view_func.__module__,
+                view_func.__name__,
+                request_data,
+                task_id
+            )
+            
+            # Zapisanie task_id w sesji
+            request.session[f'async_task_{request.path}'] = task.id
+            
+            # Wyświetlenie strony ładowania
+            return render(request, loading_template, {
+                'task_id': task.id,
+                'poll_interval': poll_interval,
+                'current_url': request.build_absolute_uri(),
+                'timeout': timeout * 1000,
+                'view_name': view_func.__name__
+            })
+        
+        return wrapper
+    return decorator
+
+
+# Przykład użycia w views.py
+
+# views.py
+import time
+from django.shortcuts import render
+from django.http import JsonResponse
+from .decorators import async_processing
+
+@async_processing(
+    loading_template='custom_loading.html',
+    timeout=600,  # 10 minut
+    poll_interval=1000  # sprawdzaj co sekundę
+)
+def slow_calculation_view(request):
+    """Przykład długotrwałego endpointa"""
+    # Symulacja długich obliczeń
+    time.sleep(10)
+    
+    # Twoje obliczenia tutaj
+    result = "Wynik skomplikowanych obliczeń"
+    
+    return render(request, 'results.html', {'result': result})
+
+
+@async_processing()
+def another_slow_view(request):
+    """Inny przykład z domyślnymi ustawieniami"""
+    # Długie operacje na bazie danych
+    time.sleep(15)
+    
+    return JsonResponse({'status': 'completed', 'data': 'some data'})
+
+
+# management/commands/cleanup_async_tasks.py
+from django.core.management.base import BaseCommand
+from django.contrib.sessions.models import Session
+from celery.result import AsyncResult
+import json
+
+class Command(BaseCommand):
+    help = 'Czyści stare zadania async z sesji'
+    
+    def handle(self, *args, **options):
+        for session in Session.objects.all():
+            session_data = session.get_decoded()
+            to_remove = []
+            
+            for key, task_id in session_data.items():
+                if key.startswith('async_task_'):
+                    result = AsyncResult(task_id)
+                    if result.ready() or result.failed():
+                        to_remove.append(key)
+            
+            for key in to_remove:
+                del session_data[key]
+            
+            if to_remove:
+                session.session_data = session.encode(session_data)
+                session.save()
+                
+            self.stdout.write(f'Usunięto {len(to_remove)} starych zadań z sesji')
+
+
+
+
+// WYJAŚNIENIE MECHANIZMU SPRAWDZANIA STATUSU (POLLING)
+
+// 1. ZMIENNE KONFIGURACYJNE PRZEKAZANE Z DJANGO
+const TASK_ID = '{{ task_id }}';           // ID zadania Celery
+const POLL_INTERVAL = {{ poll_interval }}; // CZAS MIĘDZY SPRAWDZENIAMI w milisekundach
+const TIMEOUT = {{ timeout }};             // Maksymalny czas oczekiwania w milisekundach
+const CURRENT_URL = '{{ current_url }}';   // URL do sprawdzania statusu
+
+// Przykład wartości:
+// POLL_INTERVAL = 1000  (sprawdzaj co 1 sekundę)
+// POLL_INTERVAL = 2000  (sprawdzaj co 2 sekundy) 
+// POLL_INTERVAL = 500   (sprawdzaj co 0.5 sekundy)
+
+// 2. GŁÓWNA FUNKCJA SPRAWDZAJĄCA STATUS
+function checkTaskStatus() {
+    const elapsed = Date.now() - startTime;
+    pollCount++;
+    
+    // A) SPRAWDŹ TIMEOUT
+    if (elapsed > TIMEOUT) {
+        showError('Przekroczono maksymalny czas oczekiwania');
+        return; // KONIEC - nie planuj kolejnego sprawdzenia
+    }
+    
+    // B) WYŚLIJ ŻĄDANIE AJAX DO SERWERA
+    fetch(`${CURRENT_URL}?check_status=1&task_id=${TASK_ID}`)
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'completed') {
+                // ZADANIE ZAKOŃCZONE - nie planuj kolejnego sprawdzenia
+                showSuccess();
+                setTimeout(() => {
+                    if (data.content) {
+                        document.body.innerHTML = data.content;
+                    } else {
+                        location.reload();
+                    }
+                }, 1000);
+                
+            } else if (data.status === 'error') {
+                // BŁĄD - nie planuj kolejnego sprawdzenia
+                showError(data.error || 'Wystąpił nieznany błąd');
+                
+            } else {
+                // ZADANIE WCIĄŻ SIĘ WYKONUJE - zaplanuj kolejne sprawdzenie
+                console.log(`Sprawdzenie #${pollCount}: zadanie w toku, następne za ${POLL_INTERVAL}ms`);
+                
+                // *** TO JEST KLUCZOWA LINIA - PLANOWANIE KOLEJNEGO SPRAWDZENIA ***
+                setTimeout(checkTaskStatus, POLL_INTERVAL);
+                //         ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+                //         ta sama funkcja   opóźnienie w ms
+            }
+        })
+        .catch(error => {
+            console.error('Błąd sprawdzania statusu:', error);
+            // BŁĄD SIECI - spróbuj ponownie za chwilę
+            setTimeout(checkTaskStatus, POLL_INTERVAL);
+        });
+}
+
+// 3. PIERWSZE URUCHOMIENIE
+// Zaplanuj pierwsze sprawdzenie po upływie POLL_INTERVAL
+setTimeout(checkTaskStatus, POLL_INTERVAL);
+
+// PRZYKŁAD DZIAŁANIA Z poll_interval=1000:
+// t=0s:     Strona się ładuje
+// t=1s:     Pierwsze sprawdzenie statusu (checkTaskStatus)
+// t=2s:     Drugie sprawdzenie (jeśli zadanie wciąż trwa)  
+// t=3s:     Trzecie sprawdzenie (jeśli zadanie wciąż trwa)
+// t=4s:     Czwarte sprawdzenie - zadanie gotowe -> KONIEC
+
+// PRZYKŁAD DZIAŁANIA Z poll_interval=2000:
+// t=0s:     Strona się ładuje  
+// t=2s:     Pierwsze sprawdzenie
+// t=4s:     Drugie sprawdzenie
+// t=6s:     Trzecie sprawdzenie - zadanie gotowe -> KONIEC
+
+// 4. MECHANIZM REKURENCYJNY
+/*
+checkTaskStatus() wywołuje samą siebie przez setTimeout() w pętli:
+
+checkTaskStatus() 
+    ↓ (po POLL_INTERVAL ms)
+checkTaskStatus()
+    ↓ (po POLL_INTERVAL ms)  
+checkTaskStatus()
+    ↓ (po POLL_INTERVAL ms)
+checkTaskStatus() → zadanie gotowe → STOP
+
+Każde wywołanie:
+1. Sprawdza czy nie ma timeout
+2. Wysyła AJAX do Django view
+3. Django sprawdza status zadania Celery 
+4. Jeśli zadanie trwa → planuje kolejne sprawdzenie
+5. Jeśli zadanie skończone → pokazuje wynik i kończy
+*/
+
+// 5. STRONA DJANGO OBSŁUGUJĄCA SPRAWDZANIA
+/*
+W dekoratorze, gdy request.GET.get('check_status'):
+
+@async_processing()
+def my_view(request):
+    # To się wykonuje tylko raz, na początku
+    
+    # Ale dekorator dodaje logikę:
+    if request.GET.get('check_status'):
+        task_id = request.GET.get('task_id')
+        result = AsyncResult(task_id)  # Sprawdź status w Celery
+        
+        if result.ready():
+            return JsonResponse({'status': 'completed', ...})
+        else:
+            return JsonResponse({'status': 'processing'})
+*/
+
+// PODSUMOWANIE:
+// - POLL_INTERVAL = czas między sprawdzeniami w milisekundach
+// - setTimeout(function, delay) = zaplanuj wykonanie funkcji za 'delay' ms
+// - Rekurencyjne wywołania tworzą pętlę sprawdzania
+// - Pętla kończy się gdy zadanie jest gotowe lub wystąpi błąd
+
+
+
+<!-- templates/async_loading.html -->
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Przetwarzanie...</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f5f5f5;
+        }
+        .loading-container {
+            text-align: center;
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            max-width: 500px;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background-color: #f0f0f0;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 20px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background-color: #3498db;
+            width: 0%;
+            animation: progress 2s ease-in-out infinite;
+        }
+        @keyframes progress {
+            0%, 100% { width: 10%; }
+            50% { width: 90%; }
+        }
+        .status-text {
+            color: #666;
+            margin: 15px 0;
+        }
+        .error-message {
+            color: #e74c3c;
+            margin-top: 20px;
+            display: none;
+        }
+        .success-message {
+            color: #27ae60;
+            margin-top: 20px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="loading-container">
+        <h2>Przetwarzanie żądania...</h2>
+        <div class="spinner"></div>
+        <div class="progress-bar">
+            <div class="progress-fill"></div>
+        </div>
+        <div class="status-text" id="status">
+            Wykonywanie obliczeń w tle. Proszę czekać...
+        </div>
+        <div class="error-message" id="error-message">
+            Wystąpił błąd podczas przetwarzania. Spróbuj ponownie.
+        </div>
+        <div class="success-message" id="success-message">
+            Przetwarzanie zakończone pomyślnie!
+        </div>
+    </div>
+
+    <script>
+        const TASK_ID = '{{ task_id }}';
+        const POLL_INTERVAL = {{ poll_interval }};
+        const TIMEOUT = {{ timeout }};
+        const CURRENT_URL = '{{ current_url }}';
+        
+        let startTime = Date.now();
+        let pollCount = 0;
+        
+        function updateStatus(message) {
+            document.getElementById('status').textContent = message;
+        }
+        
+        function showError(message) {
+            document.querySelector('.spinner').style.display = 'none';
+            document.querySelector('.progress-bar').style.display = 'none';
+            document.getElementById('error-message').style.display = 'block';
+            document.getElementById('error-message').textContent = message;
+        }
+        
+        function showSuccess() {
+            document.querySelector('.spinner').style.display = 'none';
+            document.querySelector('.progress-bar').style.display = 'none';
+            document.getElementById('success-message').style.display = 'block';
+        }
+        
+        function checkTaskStatus() {
+            const elapsed = Date.now() - startTime;
+            pollCount++;
+            
+            // Sprawdź timeout
+            if (elapsed > TIMEOUT) {
+                showError('Przekroczono maksymalny czas oczekiwania. Spróbuj ponownie.');
+                return;
+            }
+            
+            // Zaktualizuj status
+            const minutes = Math.floor(elapsed / 60000);
+            const seconds = Math.floor((elapsed % 60000) / 1000);
+            updateStatus(`Przetwarzanie... ${minutes}:${seconds.toString().padStart(2, '0')}`);
+            
+            // Sprawdź status zadania
+            fetch(`${CURRENT_URL}?check_status=1&task_id=${TASK_ID}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'completed') {
+                        showSuccess();
+                        setTimeout(() => {
+                            if (data.content) {
+                                // Wstaw zawartość do strony
+                                document.body.innerHTML = data.content;
+                            } else if (data.redirect) {
+                                window.location.href = data.redirect;
+                            } else {
+                                location.reload();
+                            }
+                        }, 1000);
+                    } else if (data.status === 'error') {
+                        showError(data.error || 'Wystąpił nieznany błąd');
+                    } else {
+                        // Kontynuuj sprawdzanie - TO JEST KLUCZOWE MIEJSCE GDZIE DZIEJE SIĘ POLLING
+                        console.log(`Sprawdzenie #${pollCount}: zadanie w toku, następne za ${POLL_INTERVAL}ms`);
+                        setTimeout(checkTaskStatus, POLL_INTERVAL);
+                        //         ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+                        //         wywołaj tę samą  za tyle milisekund
+                        //         funkcję ponownie
+                    }
+                })
+                .catch(error => {
+                    console.error('Błąd sprawdzania statusu:', error);
+                    // Spróbuj ponownie za POLL_INTERVAL milisekund
+                    setTimeout(checkTaskStatus, POLL_INTERVAL);
+                });
+        }
+        
+        // Rozpocznij sprawdzanie statusu po pierwszym interwale
+        console.log(`Początkowe opóźnienie: ${POLL_INTERVAL}ms, potem sprawdzanie co ${POLL_INTERVAL}ms`);
+        setTimeout(checkTaskStatus, POLL_INTERVAL);
+        
+        // Zapobiegaj zamknięciu strony podczas przetwarzania
+        window.addEventListener('beforeunload', function(e) {
+            const confirmationMessage = 'Przetwarzanie jest w toku. Czy na pewno chcesz opuścić stronę?';
+            e.returnValue = confirmationMessage;
+            return confirmationMessage;
+        });
+    </script>
+</body>
+</html>
+
+<!-- templates/custom_loading.html (opcjonalny, bardziej zaawansowany) -->
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Przetwarzanie - {{ view_name }}</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .container {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            padding: 50px 40px;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            max-width: 500px;
+            width: 90%;
+        }
+        
+        .icon {
+            font-size: 60px;
+            color: #667eea;
+            margin-bottom: 20px;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 24px;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 16px;
+        }
+        
+        .progress-container {
+            margin: 30px 0;
+        }
+        
+        .progress-bar {
+            height: 6px;
+            background: #e0e0e0;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-bottom: 15px;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            border-radius: 3px;
+            animation: loading 2s ease-in-out infinite;
+        }
+        
+        @keyframes loading {
+            0% { width: 0%; }
+            50% { width: 70%; }
+            100% { width: 100%; }
+        }
+        
+        .timer {
+            font-family: 'Courier New', monospace;
+            font-size: 18px;
+            color: #667eea;
+            font-weight: bold;
+        }
+        
+        .warning {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            color: #856404;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">
+            <i class="fas fa-cog fa-spin"></i>
+        </div>
+        <h1>Przetwarzanie danych</h1>
+        <div class="subtitle">Wykonujemy skomplikowane obliczenia...</div>
+        
+        <div class="progress-container">
+            <div class="progress-bar">
+                <div class="progress-fill"></div>
+            </div>
+            <div class="timer" id="timer">00:00</div>
+        </div>
+        
+        <div class="warning">
+            <i class="fas fa-info-circle"></i>
+            Nie zamykaj tej strony. Obliczenia są wykonywane w tle i zostaną ukończone wkrótce.
+        </div>
+    </div>
+
+    <script>
+        const TASK_ID = '{{ task_id }}';
+        const POLL_INTERVAL = {{ poll_interval }};
+        const TIMEOUT = {{ timeout }};
+        const CURRENT_URL = '{{ current_url }}';
+        
+        let startTime = Date.now();
+        
+        function updateTimer() {
+            const elapsed = Date.now() - startTime;
+            const minutes = Math.floor(elapsed / 60000);
+            const seconds = Math.floor((elapsed % 60000) / 1000);
+            document.getElementById('timer').textContent = 
+                `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+        
+        function checkTaskStatus() {
+            const elapsed = Date.now() - startTime;
+            
+            if (elapsed > TIMEOUT) {
+                document.querySelector('.container').innerHTML = `
+                    <div class="icon" style="color: #e74c3c;">
+                        <i class="fas fa-exclamation-triangle"></i>
+                    </div>
+                    <h1 style="color: #e74c3c;">Timeout</h1>
+                    <div class="subtitle">Przekroczono maksymalny czas oczekiwania</div>
+                    <button onclick="location.reload()" style="
+                        background: #667eea; 
+                        color: white; 
+                        border: none; 
+                        padding: 10px 20px; 
+                        border-radius: 5px; 
+                        cursor: pointer;
+                        margin-top: 20px;
+                    ">Spróbuj ponownie</button>
+                `;
+                return;
+            }
+            
+            fetch(`${CURRENT_URL}?check_status=1&task_id=${TASK_ID}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'completed') {
+                        document.querySelector('.container').innerHTML = `
+                            <div class="icon" style="color: #27ae60;">
+                                <i class="fas fa-check-circle"></i>
+                            </div>
+                            <h1 style="color: #27ae60;">Ukończono!</h1>
+                            <div class="subtitle">Przekierowywanie...</div>
+                        `;
+                        setTimeout(() => {
+                            if (data.content) {
+                                document.body.innerHTML = data.content;
+                            } else {
+                                location.reload();
+                            }
+                        }, 1500);
+                    } else if (data.status === 'error') {
+                        document.querySelector('.container').innerHTML = `
+                            <div class="icon" style="color: #e74c3c;">
+                                <i class="fas fa-exclamation-triangle"></i>
+                            </div>
+                            <h1 style="color: #e74c3c;">Błąd</h1>
+                            <div class="subtitle">${data.error}</div>
+                            <button onclick="location.reload()" style="
+                                background: #667eea; 
+                                color: white; 
+                                border: none; 
+                                padding: 10px 20px; 
+                                border-radius: 5px; 
+                                cursor: pointer;
+                                margin-top: 20px;
+                            ">Spróbuj ponownie</button>
+                        `;
+                    } else {
+                        setTimeout(checkTaskStatus, POLL_INTERVAL);
+                    }
+                })
+                .catch(error => {
+                    console.error('Błąd:', error);
+                    setTimeout(checkTaskStatus, POLL_INTERVAL);
+                });
+        }
+        
+        // Aktualizuj timer co sekundę
+        setInterval(updateTimer, 1000);
+        
+        // Rozpocznij sprawdzanie
+        setTimeout(checkTaskStatus, POLL_INTERVAL);
+    </script>
+</body>
+</html>
+
+<!-- templates/async_error.html -->
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Błąd przetwarzania</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f8f9fa;
+        }
+        .error-container {
+            text-align: center;
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            border-left: 5px solid #e74c3c;
+        }
+        .error-icon {
+            font-size: 60px;
+            color: #e74c3c;
+            margin-bottom: 20px;
+        }
+        h2 {
+            color: #e74c3c;
+            margin-bottom: 20px;
+        }
+        .retry-button {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 20px;
+        }
+        .retry-button:hover {
+            background: #2980b9;
+        }
+    </style>
+</head>
+<body>
+    <div class="error-container">
+        <div class="error-icon">⚠️</div>
+        <h2>Wystąpił błąd</h2>
+        <p>{{ error_message|default:"Nie udało się przetworzyć żądania. Spróbuj ponownie." }}</p>
+        <button class="retry-button" onclick="history.back()">Wróć</button>
+        <button class="retry-button" onclick="location.reload()">Spróbuj ponownie</button>
+    </div>
+</body>
+</html>
+
+

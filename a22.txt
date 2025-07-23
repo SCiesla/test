@@ -1,0 +1,323 @@
+# decorators.py
+import functools
+import json
+from django.http import JsonResponse
+from django.shortcuts import render, redirect
+from celery import shared_task
+from celery.result import AsyncResult
+import uuid
+
+
+@shared_task
+def execute_view_task(view_module, view_name, request_data, task_id):
+    """Zadanie Celery wykonujące oryginalną funkcję view w tle"""
+    try:
+        # Import modułu i funkcji view
+        module = __import__(view_module, fromlist=[view_name])
+        view_func = getattr(module, view_name)
+        
+        # Rekonstrukcja request (uproszczona)
+        from django.test import RequestFactory
+        factory = RequestFactory()
+        
+        if request_data['method'] == 'POST':
+            request = factory.post(
+                request_data['path'],
+                data=request_data.get('POST', {})
+            )
+        else:
+            request = factory.get(request_data['path'], request_data.get('GET', {}))
+        
+        # Dodanie atrybutów do request
+        if request_data.get('user_id'):
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            request.user = User.objects.get(id=request_data['user_id'])
+        
+        # Wykonanie oryginalnej funkcji
+        result = view_func(request, **request_data.get('kwargs', {}))
+        
+        return {
+            'success': True,
+            'task_id': task_id,
+            'completed': True
+        }
+            
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e),
+            'task_id': task_id
+        }
+
+
+def async_processing(
+    loading_template='async_loading.html',
+    success_url=None,  # URL do przekierowania po sukcesie
+    timeout=300  # 5 minut
+):
+    """
+    Prosty dekorator dla długotrwałych endpointów Django
+    """
+    def decorator(view_func):
+        @functools.wraps(view_func)
+        def wrapper(request, *args, **kwargs):
+            
+            # Sprawdź czy to żądanie sprawdzające status
+            if request.GET.get('check_status'):
+                task_id = request.GET.get('task_id')
+                if task_id:
+                    result = AsyncResult(task_id)
+                    
+                    if result.ready():
+                        task_result = result.get()
+                        if task_result.get('success'):
+                            # Zadanie zakończone pomyślnie
+                            # Usuń task_id z sesji
+                            session_key = f'async_task_{request.path}'
+                            if session_key in request.session:
+                                del request.session[session_key]
+                            
+                            return JsonResponse({
+                                'status': 'completed',
+                                'success': True,
+                                'redirect_url': success_url or request.path
+                            })
+                        else:
+                            return JsonResponse({
+                                'status': 'error',
+                                'error': task_result.get('error', 'Nieznany błąd')
+                            })
+                    else:
+                        return JsonResponse({'status': 'processing'})
+                
+                return JsonResponse({'status': 'error', 'error': 'Brak task_id'})
+            
+            # Sprawdź czy zadanie już istnieje w sesji
+            existing_task_id = request.session.get(f'async_task_{request.path}')
+            if existing_task_id:
+                result = AsyncResult(existing_task_id)
+                if not result.ready():
+                    # Zadanie wciąż się wykonuje, pokaż loading
+                    return render(request, loading_template, {
+                        'task_id': existing_task_id,
+                        'current_url': request.build_absolute_uri(),
+                        'view_name': view_func.__name__
+                    })
+            
+            # Przygotowanie danych dla zadania
+            request_data = {
+                'method': request.method,
+                'path': request.path,
+                'GET': dict(request.GET),
+                'POST': dict(request.POST) if request.method == 'POST' else {},
+                'kwargs': kwargs,
+                'user_id': request.user.id if request.user.is_authenticated else None,
+            }
+            
+            # Uruchomienie zadania w tle
+            task = execute_view_task.delay(
+                view_func.__module__,
+                view_func.__name__,
+                request_data,
+                str(uuid.uuid4())
+            )
+            
+            # Zapisanie task_id w sesji
+            request.session[f'async_task_{request.path}'] = task.id
+            
+            # Wyświetlenie strony ładowania
+            return render(request, loading_template, {
+                'task_id': task.id,
+                'current_url': request.build_absolute_uri(),
+                'view_name': view_func.__name__,
+                'success_url': success_url or request.path
+            })
+        
+        return wrapper
+    return decorator
+
+
+# Przykłady użycia w views.py
+import time
+from .decorators import async_processing
+
+@async_processing()
+def slow_calculation_view(request):
+    """Przykład długotrwałego endpointa - po zakończeniu wróci na tę samą stronę"""
+    time.sleep(10)  # Symulacja długich obliczeń
+    
+    result = "Wynik skomplikowanych obliczeń"
+    return render(request, 'results.html', {'result': result})
+
+
+@async_processing(success_url='/dashboard/')
+def data_processing_view(request):
+    """Po zakończeniu przekieruje na /dashboard/"""
+    time.sleep(15)  # Długie przetwarzanie danych
+    
+    # Zapisz wyniki do bazy danych
+    # ... twoje operacje ...
+    
+    return redirect('/dashboard/')
+
+
+@async_processing(loading_template='custom_loading.html', timeout=600)
+def complex_report_view(request):
+    """Z niestandardowym szablonem i dłuższym timeoutem"""
+    time.sleep(30)  # Generowanie raportu
+    
+    return render(request, 'report.html', {'data': 'report_data'})
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!-- templates/async_loading.html -->
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Przetwarzanie...</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .loading-container {
+            text-align: center;
+            background: white;
+            padding: 50px;
+            border-radius: 15px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+            max-width: 400px;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        h2 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        .status-text {
+            color: #666;
+            margin: 20px 0;
+            font-size: 16px;
+        }
+        .timer {
+            font-family: 'Courier New', monospace;
+            font-size: 18px;
+            color: #667eea;
+            font-weight: bold;
+            margin: 15px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="loading-container">
+        <h2>Przetwarzanie w tle...</h2>
+        <div class="spinner"></div>
+        <div class="status-text">
+            Wykonywanie obliczeń. Nie zamykaj tej strony.
+        </div>
+        <div class="timer" id="timer">00:00</div>
+    </div>
+
+    <script>
+        const TASK_ID = '{{ task_id }}';
+        const CURRENT_URL = '{{ current_url }}';
+        const SUCCESS_URL = '{{ success_url }}';
+        
+        let startTime = Date.now();
+        
+        // Aktualizuj timer
+        function updateTimer() {
+            const elapsed = Date.now() - startTime;
+            const minutes = Math.floor(elapsed / 60000);
+            const seconds = Math.floor((elapsed % 60000) / 1000);
+            document.getElementById('timer').textContent = 
+                `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+        
+        // Sprawdź status zadania
+        function checkStatus() {
+            fetch(`${CURRENT_URL}?check_status=1&task_id=${TASK_ID}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'completed') {
+                        // Zadanie zakończone - przekieruj
+                        document.querySelector('.loading-container').innerHTML = `
+                            <h2 style="color: #27ae60;">✓ Gotowe!</h2>
+                            <div class="status-text">Przekierowywanie...</div>
+                        `;
+                        
+                        setTimeout(() => {
+                            window.location.href = data.redirect_url || SUCCESS_URL || CURRENT_URL;
+                        }, 1500);
+                        
+                    } else if (data.status === 'error') {
+                        // Błąd
+                        document.querySelector('.loading-container').innerHTML = `
+                            <h2 style="color: #e74c3c;">⚠ Błąd</h2>
+                            <div class="status-text">${data.error}</div>
+                            <button onclick="location.reload()" style="
+                                background: #667eea; 
+                                color: white; 
+                                border: none; 
+                                padding: 10px 20px; 
+                                border-radius: 5px; 
+                                cursor: pointer;
+                                margin-top: 15px;
+                            ">Spróbuj ponownie</button>
+                        `;
+                    } else {
+                        // Wciąż przetwarzanie - sprawdź ponownie za 2 sekundy
+                        setTimeout(checkStatus, 2000);
+                    }
+                })
+                .catch(error => {
+                    console.error('Błąd:', error);
+                    setTimeout(checkStatus, 2000);
+                });
+        }
+        
+        // Uruchom timer i sprawdzanie
+        setInterval(updateTimer, 1000);
+        setTimeout(checkStatus, 2000); // Pierwsze sprawdzenie za 2 sekundy
+        
+        // Zapobiegaj zamknięciu strony
+        window.addEventListener('beforeunload', function(e) {
+            const message = 'Przetwarzanie w toku. Czy na pewno chcesz opuścić stronę?';
+            e.returnValue = message;
+            return message;
+        });
+    </script>
+</body>
+</html>
